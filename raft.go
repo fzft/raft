@@ -2,9 +2,18 @@ package raft
 
 import (
 	log "github.com/sirupsen/logrus"
+	"math/rand"
 	"sync"
 	"time"
 )
+
+
+func init() {
+	log.SetFormatter(&log.TextFormatter{
+		TimestampFormat: "2006-01-02 15:04:05.000",
+		DisableQuote: true,
+	})
+}
 
 type Role int64
 
@@ -52,58 +61,60 @@ type Engine struct {
 	srv         *Server
 	leaderId    int64
 
-	electionTimeout int64
+	electionResetEvent time.Time
 }
 
-func NewEngine(id int64, s *Server) *Engine {
-	return &Engine{
-		id:  id,
-		srv: s,
+func NewEngine(id int64, s *Server, peerIds []int64, ready chan struct{}) *Engine {
+	e := &Engine{
+		id:       id,
+		srv:      s,
+		role:     Joining,
+		peers:    make(map[int64]Peer),
+		votedFor: -1,
 	}
-}
 
-func (e *Engine) start() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.role = Follower
-	e.votedFor = -1
-	e.electionTimeout = 10
-	go e.runPeriodTasks()
+	e.addPeers(peerIds...)
+	go func() {
+		<-ready
+		e.mu.Lock()
+		e.electionResetEvent = time.Now()
+		e.mu.Unlock()
+		e.runPeriodTasks()
+	}()
+	return e
 }
 
 func (e *Engine) stop() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.role = Leaving
-	log.Infof("raft stopped")
+	log.Infof("[%d] raft stopped", e.id)
 }
 
-func (e *Engine) rescheduleElection() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.electionTimeout = time.Now().UnixMilli() + 2500
+func (e *Engine) addPeers(ids ...int64) {
+	for _, id := range ids {
+		if _, ok := e.peers[id]; !ok {
+			e.peers[id] = Peer{id: id}
+		}
+	}
 }
+
 
 func (e *Engine) runPeriodTasks() {
+	electionTimeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
 	for e.role != Leaving {
-		if e.role != Leaving {
-			e.role = Failed
-		}
+		<-ticker.C
 		switch e.role {
 		case Joining:
 			e.role = Follower
-			e.rescheduleElection()
-			break
+			e.electionResetEvent = time.Now()
 		case Observer:
-			break
-		case Follower:
-			break
-		case Candidate:
-			if time.Now().UnixMilli() > e.electionTimeout {
+		case Candidate, Follower:
+			if elapsed := time.Since(e.electionResetEvent); elapsed > electionTimeout {
 				e.callElection()
 			}
-			break
-
 		}
 	}
 }
@@ -113,26 +124,27 @@ func (e *Engine) callElection() {
 		return
 	}
 	votesNeeded := (len(e.peers) + 1) / 2
-	votes := 1
+	votes := 0
 	e.role = Candidate
 	e.currentTerm++
+	savedCurrentTerm := e.currentTerm
 	e.leaderId = 0
 	e.votedFor = e.id
-	log.Infof("%d is calling en election (term %d)", e.id, e.currentTerm)
+	e.electionResetEvent = time.Now()
 	for _, p := range e.peers {
 		go func(p Peer) {
 			args := &RequestVoteArgs{
-				Term:        e.currentTerm,
+				Term:        savedCurrentTerm,
 				CandidateId: e.id,
 			}
 
-			var reply *RequestVoteReply
+			reply := new(RequestVoteReply)
 
-			if err := e.srv.Call(p.id, "Engine.SendRequestVote", args, reply); err != nil {
+			if err := e.srv.Call(p.id, "Engine.SendRequestVote", args, reply); err == nil {
 				e.mu.Lock()
 				defer e.mu.Unlock()
 				if !e.stepDown(reply.Term) {
-					if reply.Term == e.currentTerm && e.role == Candidate {
+					if reply.Term == savedCurrentTerm && e.role == Candidate {
 						if reply.VoteGranted {
 							votes++
 						}
@@ -140,7 +152,12 @@ func (e *Engine) callElection() {
 							e.becomeLeader()
 						}
 					}
+				} else {
+					log.Infof("[%d] engine term out of date (term %d)", e.id, reply.Term)
+					e.becomeFollower(reply.Term)
 				}
+			} else {
+				log.Infof("[%d] engine rpc [Engine.SendRequestVote] got error: %s", e.id, err.Error())
 			}
 		}(p)
 	}
@@ -157,18 +174,19 @@ func (e *Engine) SendRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 	if e.currentTerm < args.Term {
 		log.Infof("%d term out of date (term %d < %d)", e.id, e.currentTerm, args.Term)
 		e.becomeFollower(args.Term)
-		return nil
 	}
 
 	if e.currentTerm == args.Term && (e.votedFor == -1 || e.votedFor == args.CandidateId) {
 		reply.VoteGranted = true
 		e.votedFor = args.CandidateId
-		e.rescheduleElection()
+		e.electionResetEvent = time.Now()
 	} else {
 		reply.VoteGranted = false
 	}
-	log.Infof("%d request vote response %v", e.id, reply)
+
 	reply.Term = e.currentTerm
+	log.Tracef("[%d] engine request vote response %+v", e.id, reply)
+
 	return nil
 }
 
@@ -181,7 +199,7 @@ func (e *Engine) SendAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	}
 
 	if e.currentTerm < args.Term {
-		log.Infof("%d term out of date (term %d < %d)", e.id, e.currentTerm, args.Term)
+		log.Infof("[%d] engine term out of date (term %d < %d)", e.id, e.currentTerm, args.Term)
 		e.becomeFollower(args.Term)
 		return nil
 	}
@@ -190,12 +208,12 @@ func (e *Engine) SendAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		if e.role != Follower {
 			e.becomeFollower(args.Term)
 		}
-		e.rescheduleElection()
+		e.electionResetEvent = time.Now()
 		reply.Success = true
 	}
 
 	reply.Term = e.currentTerm
-	log.Infof("%d request append entries response %v", e.id, reply)
+	log.Tracef("[%d] engine request append entries response %+v", e.id, reply)
 	return nil
 }
 
@@ -203,17 +221,17 @@ func (e *Engine) stepDown(term int64) bool {
 	if term > e.currentTerm {
 		e.currentTerm = term
 		if e.role == Candidate || e.role == Leader {
-			log.Infof("%d is stepping down (term %d)", e.id, e.currentTerm)
+			log.Infof("[%d] engine is stepping down (term %d)", e.id, e.currentTerm)
 			e.role = Follower
 		}
-		e.rescheduleElection()
+		e.electionResetEvent = time.Now()
 		return true
 	}
 	return false
 }
 
 func (e *Engine) becomeLeader() {
-	log.Infof("%d is becoming the leader (term %d)", e.id, e.currentTerm)
+	log.Infof("[%d] engine is becoming the leader (term %d)", e.id, e.currentTerm)
 	e.role = Leader
 	e.leaderId = e.id
 	go func() {
@@ -234,12 +252,11 @@ func (e *Engine) becomeLeader() {
 }
 
 func (e *Engine) becomeFollower(term int64) {
-	log.Infof("%d becoming the follower (term %d)", e.id, term)
+	log.Infof("[%d] engine becoming the follower (term %d)", e.id, term)
 	e.currentTerm = term
 	e.role = Follower
 	e.votedFor = -1
-	e.rescheduleElection()
-
+	e.electionResetEvent = time.Now()
 }
 
 func (e *Engine) updatePeers() {
@@ -247,20 +264,21 @@ func (e *Engine) updatePeers() {
 	savedCurrentTerm := e.currentTerm
 	e.mu.Unlock()
 	for _, p := range e.peers {
-		log.Infof("sending AppendEntries to %d:", p.id)
 		go func() {
 			args := &AppendEntriesArgs{
 				Term:     e.currentTerm,
 				LeaderId: e.id,
 			}
 
-			var reply *AppendEntriesReply
+			reply := new(AppendEntriesReply)
 
-			if err := e.srv.Call(p.id, "Engine.SendAppendEntries", args, reply); err != nil {
+			if err := e.srv.Call(p.id, "Engine.SendAppendEntries", args, reply); err == nil {
 				if e.stepDown(savedCurrentTerm) {
 					log.Infof("%d term out of date (term %d < %d)", e.id, savedCurrentTerm, reply.Term)
 					e.becomeFollower(reply.Term)
 				}
+			} else {
+				log.Infof("[%d] engine rpc [Engine.SendAppendEntries] got error: %s", e.id, err.Error())
 			}
 		}()
 	}
