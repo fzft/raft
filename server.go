@@ -46,7 +46,6 @@ func (s *Server) Serve() {
 	s.mu.Unlock()
 
 	go func() {
-
 		for {
 			conn, err := s.listener.Accept()
 			if err != nil {
@@ -62,6 +61,8 @@ func (s *Server) Serve() {
 			}()
 		}
 	}()
+
+
 }
 
 func (s *Server) Call(id int64, serviceMethod string, args interface{}, reply interface{}) error {
@@ -78,6 +79,7 @@ func (s *Server) Call(id int64, serviceMethod string, args interface{}, reply in
 
 func (s *Server) Shutdown() {
 	s.raft.stop()
+	close(s.stopCh)
 	s.listener.Close()
 }
 

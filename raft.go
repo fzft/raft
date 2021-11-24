@@ -27,8 +27,10 @@ const (
 )
 
 type RequestVoteArgs struct {
-	Term        int64
-	CandidateId int64
+	Term         int64
+	CandidateId  int64
+	LastLogIndex int64
+	LastLogTerm  int64
 }
 type RequestVoteReply struct {
 	Term        int64
@@ -45,8 +47,9 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int64
-	Success bool
+	Term         int64
+	Success      bool
+	LastLogIndex int64
 }
 
 type Peer struct {
@@ -111,7 +114,8 @@ func (e *Engine) SendRequestVote(args *RequestVoteArgs, reply *RequestVoteReply)
 		e.becomeFollower(args.Term)
 	}
 
-	if e.currentTerm == args.Term && (e.votedFor == -1 || e.votedFor == args.CandidateId) {
+	if e.currentTerm == args.Term && (e.votedFor == -1 || e.votedFor == args.CandidateId) &&
+		args.LastLogIndex >= e.log.LastIndex() && args.LastLogTerm >= e.log.LastTerm() {
 		reply.VoteGranted = true
 		e.votedFor = args.CandidateId
 		e.electionResetEvent = time.Now()
@@ -128,6 +132,10 @@ func (e *Engine) SendAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	defer func() {
+		reply.LastLogIndex = e.log.LastIndex()
+	}()
+
 	if e.role == Leaving {
 		return nil
 	}
@@ -138,21 +146,50 @@ func (e *Engine) SendAppendEntries(args *AppendEntriesArgs, reply *AppendEntries
 		return nil
 	}
 	reply.Success = false
+	defer func() {
+		reply.Term = e.currentTerm
+		log.Tracef("[%d] engine request append entries response %+v", e.id, reply)
+	}()
 	if args.Term == e.currentTerm {
 		if e.role != Follower {
 			e.becomeFollower(args.Term)
 		}
 		log.Tracef("[%d] engine reset election time", e.id)
 		e.electionResetEvent = time.Now()
-		reply.Success = true
+
+		if e.log.IsConsistentWith(args.PrevLogIndex, args.PrevLogTerm) {
+			for _, entry := range args.Entries {
+				if ok := e.log.append(entry); !ok {
+					log.Warnf("[%d] engine is failing append entries leader: %+v", e.id, entry)
+					reply.Success = false
+					return nil
+				}
+			}
+			e.log.SetCommitIndex(Min(args.LeaderCommit, e.log.LastIndex()))
+			log.Tracef("[%d] engine is fine with append entries from leader", e.id)
+			reply.Success = true
+			return nil
+		}
+		log.Warnf("[%d] engine is failing with inconsistent append entries from leader", e.id)
+		log.Warnf("[%d] engine Leader prevLogTerm=%d , prevLogIndex=%d", e.id, args.PrevLogTerm, args.PrevLogIndex)
+		log.Warnf("[%d] engine Follower firstTerm=%d, firstIndex=%d", e.id, e.log.FirstTerm(), e.log.FirstIndex())
+		log.Warnf("[%d] engine Follower lastTerm=%d, lastIndex=%d", e.id, e.log.LastTerm(), e.log.LastIndex())
 	}
 
-	reply.Term = e.currentTerm
-	log.Tracef("[%d] engine request append entries response %+v", e.id, reply)
+	log.Tracef("[%d] engine is rejecting append entries from leader", e.id)
+	reply.Success = false
 	return nil
 }
 
-func (e *Engine) executeCommand(command Command) bool {
+func (e *Engine) addPeers(ids ...int64) {
+	for _, id := range ids {
+		if _, ok := e.peers[id]; !ok {
+			e.peers[id] = &Peer{id: id}
+		}
+	}
+}
+
+func (e *Engine) executeCommand(command TestCommand) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -163,19 +200,17 @@ func (e *Engine) executeCommand(command Command) bool {
 	return false
 }
 
-func (e *Engine) Stop() {
+func (e *Engine) report() (id int64, term int64, isLeader bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.id, e.currentTerm, e.role == Leader
+}
+
+func (e *Engine) stop() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.role = Leaving
 	log.Infof("[%d] engine raft stopped", e.id)
-}
-
-func (e *Engine) addPeers(ids ...int64) {
-	for _, id := range ids {
-		if _, ok := e.peers[id]; !ok {
-			e.peers[id] = &Peer{id: id}
-		}
-	}
 }
 
 func (e *Engine) runPeriodTasks() {
@@ -231,8 +266,10 @@ func (e *Engine) callElection() {
 	for _, p := range e.peers {
 		go func(p *Peer) {
 			args := &RequestVoteArgs{
-				Term:        savedCurrentTerm,
-				CandidateId: e.id,
+				Term:         savedCurrentTerm,
+				CandidateId:  e.id,
+				LastLogTerm:  e.log.LastTerm(),
+				LastLogIndex: e.log.LastIndex(),
 			}
 
 			reply := new(RequestVoteReply)
@@ -280,7 +317,7 @@ func (e *Engine) becomeLeader() {
 	e.firstIndexOfTerm = e.log.LastIndex() + 1
 	for _, p := range e.peers {
 		p.matchIndex = 0
-		p.nextIndex = e.log.Size()
+		p.nextIndex = e.log.LastIndex() + 1
 	}
 
 	go func() {
@@ -289,6 +326,7 @@ func (e *Engine) becomeLeader() {
 		for {
 			e.updatePeers()
 			<-ticker.C
+			e.updateCommitIndex()
 
 			e.mu.Lock()
 			if e.role != Leader {
@@ -317,10 +355,19 @@ func (e *Engine) updatePeers() {
 	for _, p := range e.peers {
 		go func(p *Peer) {
 			e.mu.Lock()
-
+			prevLogIndex := p.nextIndex - 1
+			prevLogTerm, _ := e.log.getTerm(prevLogIndex)
+			var entries []Entry
+			if prevLogIndex > -1 {
+				entries = e.log.GetEntries(prevLogIndex)
+			}
 			args := &AppendEntriesArgs{
-				Term:     e.currentTerm,
-				LeaderId: e.id,
+				Term:         e.currentTerm,
+				LeaderId:     e.id,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: e.log.CommitIndex(),
 			}
 			e.mu.Unlock()
 
@@ -332,6 +379,25 @@ func (e *Engine) updatePeers() {
 				if e.stepDown(reply.Term) {
 					log.Infof("%d term out of date (term %d < %d)", e.id, savedCurrentTerm, reply.Term)
 					e.becomeFollower(reply.Term)
+				} else {
+					p.fresh = false
+					if reply.Success {
+						entries = args.Entries
+						if len(entries) > 0 {
+							p.matchIndex = entries[len(entries)-1].Index
+							p.nextIndex = p.matchIndex + 1
+						} else {
+							p.nextIndex = Max(reply.LastLogIndex+1, 1)
+						}
+						log.Tracef("[%d] engine leader appendEntries reply from %d, success, nextIndex: %d, matchIndex: %d, (lastLogIndex=%d)", e.id, p.id, p.nextIndex, p.matchIndex, reply.LastLogIndex)
+					} else {
+						if p.nextIndex > reply.LastLogIndex {
+							p.nextIndex = Max(reply.LastLogIndex+1, 1)
+						} else if p.nextIndex > 1 {
+							p.nextIndex--
+						}
+						log.Tracef("[%d] engine leader appendEntries reply from %d, failure, nextIndex:%d", e.id, p.id, p.nextIndex)
+					}
 				}
 			} else {
 				log.Infof("[%d] engine rpc [Engine.SendAppendEntries] got error: %s", e.id, err.Error())
@@ -341,6 +407,8 @@ func (e *Engine) updatePeers() {
 }
 
 func (e *Engine) updateCommitIndex() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	if e.role == Leader {
 		if e.isCommittable(e.firstIndexOfTerm) {
 			index := e.log.LastIndex()
@@ -349,14 +417,15 @@ func (e *Engine) updateCommitIndex() {
 			}
 			index = Max(index, e.log.CommitIndex())
 			for index <= e.log.LastIndex() && e.isCommittable(index) {
-				if entry, ok := e.log.Entry(index); ok && entry.term != e.lastTermCommitted {
-					log.Infof("[%d] engine committed new term %d", e.id, entry.term)
+				if entry, ok := e.log.Entry(index); ok && entry.Term != e.lastTermCommitted {
+					log.Infof("[%d] engine committed new term %d", e.id, entry.Term)
 					for _, p := range e.peers {
 						log.Infof("[%d] engine's peer [%d] has matched %d >= %d (%t)", e.id, p.id, p.matchIndex, e.firstIndexOfTerm, p.matchIndex >= e.firstIndexOfTerm)
-						e.lastTermCommitted = entry.term
+						e.lastTermCommitted = entry.Term
 					}
 				}
 				e.log.SetCommitIndex(index)
+				log.Tracef("[%d] engine leader set commitIndex %d", e.id, index)
 				index++
 			}
 		}
@@ -366,7 +435,7 @@ func (e *Engine) updateCommitIndex() {
 func (e *Engine) isCommittable(index int64) bool {
 	var (
 		count  = 1
-		needed = 1 + (1+len(e.peers))/2
+		needed = (1 + len(e.peers)) / 2
 	)
 
 	for _, p := range e.peers {

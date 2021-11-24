@@ -1,29 +1,29 @@
 package raft
 
 type Entry struct {
-	term    int64
-	index   int64
-	command Command
+	Term    int64
+	Index   int64
+	Command TestCommand
 }
 
-func NewEntry(term, index int64, command Command) Entry {
+func NewEntry(term, index int64, command TestCommand) Entry {
 	return Entry{
-		term:    term,
-		index:   index,
-		command: command,
+		Term:    term,
+		Index:   index,
+		Command: command,
 	}
 }
 
 func (e Entry) getTerm() int64 {
-	return e.term
+	return e.Term
 }
 
 func (e Entry) getIndex() int64 {
-	return e.index
+	return e.Index
 }
 
-func (e Entry) getCommand() Command {
-	return e.command
+func (e Entry) getCommand() TestCommand {
+	return e.Command
 }
 
 

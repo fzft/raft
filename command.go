@@ -1,13 +1,19 @@
 package raft
 
 type Command interface {
-	ApplyTo()
-	Write()
-	Read()
-	CommandType() int
+	Name() string
+}
+
+type TestCommand struct {
+	Name string
+}
+
+func NewTestCommand(name string) TestCommand {
+	return TestCommand{
+		Name: name,
+	}
 }
 
 
 type HealthCheckCommand struct {
 }
-
