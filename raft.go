@@ -87,7 +87,7 @@ func NewEngine(id int64, s *Server, peerIds []int64, ready chan struct{}) *Engin
 		role:     Follower,
 		peers:    make(map[int64]*Peer),
 		votedFor: -1,
-		log:      NewLog(id),
+		log:      NewLog(id, NewConfig()),
 	}
 
 	e.addPeers(peerIds...)

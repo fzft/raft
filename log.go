@@ -2,24 +2,33 @@ package raft
 
 import (
 	log "github.com/sirupsen/logrus"
+	"os"
+	"path/filepath"
 	"sync"
+	"time"
 )
 
 // Log ...
 type Log struct {
-	id          int64
-	mu          sync.Mutex
-	entries     []Entry
-	firstIndex  int64
-	firstTerm   int64
-	lastIndex   int64
-	lastTerm    int64
-	commitIndex int64
+	id            int64
+	mu            sync.Mutex
+	entries       []Entry
+	firstIndex    int64
+	firstTerm     int64
+	lastIndex     int64
+	lastTerm      int64
+	commitIndex   int64
+	snapshotIndex int64
+	snapshotTerm  int64
+	running       bool
+	config        Config
+	stateMachine  *StateMachine
 }
 
-func NewLog(id int64) *Log {
+func NewLog(id int64, config Config) *Log {
 	return &Log{
-		id: id,
+		id:     id,
+		config: config,
 	}
 }
 
@@ -116,6 +125,73 @@ func (l *Log) append(entry Entry) bool {
 		return true
 	}
 	return false
+}
+
+func (l *Log) writeLoop() {
+	var err error
+	defer func() {
+		if err != nil {
+			log.Errorf("[%d] engine log write loop got error %+v", l.id, err)
+			l.stop()
+		}
+	}()
+	for l.isRunning() {
+		err = l.updateStateMachine()
+		if err != nil {
+			break
+		}
+		err = l.compact()
+		if err != nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (l *Log) isRunning() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.running
+}
+
+func (l *Log) loadSnapshot() error {
+	file := filepath.Join(l.config.logDir, "raft.snapshot")
+	if FileExist(file) {
+		log.Infof("[%d] log loading snapshot %s", l.id, file)
+		r, err := os.Open(file)
+		if err != nil {
+			return err
+		}
+		defer r.Close()
+		err = l.stateMachine.readSnapshot(r)
+		if err != nil {
+			return err
+		}
+		l.snapshotIndex = l.stateMachine.getIndex()
+		l.commitIndex = l.stateMachine.getIndex()
+		l.snapshotIndex = l.stateMachine.getIndex()
+		l.lastIndex = l.stateMachine.getIndex()
+		l.snapshotTerm = l.stateMachine.getTerm()
+		l.lastTerm = l.stateMachine.getTerm()
+		l.firstIndex = 0
+		l.firstTerm = 0
+		l.entries = l.entries[:0]
+	}
+	return nil
+}
+
+func (l *Log) updateStateMachine() error {
+	// TODO
+	return nil
+}
+
+func (l *Log) compact() error {
+	// TODO
+	return nil
+}
+
+func (l *Log) stop() {
+	// TODO
 }
 
 func (l *Log) getTerm(index int64) (int64, bool) {
